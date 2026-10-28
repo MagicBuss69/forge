@@ -763,26 +763,27 @@ def _thinks(m):  # thinking models (qwen3, deepseek-r1...) can write untagged re
         try: _THINKS[m] = "thinking" in (ollama.show(m).get("capabilities") or [])
         except Exception: _THINKS[m] = True
     return _THINKS[m]
-def _answer(raw, model, deep):  # never return reasoning when </think> never came (ctrl-c or token cap)
+def _answer(raw, model, deep, cut=False):  # never return reasoning when </think> never came (ctrl-c or token cap)
     if "</think>" in raw: return raw.split("</think>")[-1].strip()
-    if "<think>" in raw or (_thinks(model) and not deep): return "[stopped while thinking]"
+    if "<think>" in raw or (cut and _thinks(model) and not deep): return "[stopped while thinking]"
     return raw.strip()
 def stream_reply(model, messages, deep=False, n=2000):
-    raw = ""; tokens = 0; start = time.time()
+    raw = ""; tokens = 0; start = time.time(); cut = False
     try:
         with Live(console=console, refresh_per_second=8, transient=False) as live:
             for chunk in ollama.chat(model=model, messages=messages, stream=True, think=deep, keep_alive="30m", options={"num_predict": 2000 if deep else n}):
                 raw += chunk["message"].get("content", "") or ""
+                if chunk.get("done_reason") == "length": cut = True
                 tokens += 1
                 visible = raw.split("</think>")[-1].strip() if "</think>" in raw else ("" if "<think>" in raw or (_thinks(model) and not deep) else raw)
                 status = Text(f"{SPIN[tokens % len(SPIN)]} Forging… ({int(time.time()-start)}s · ⚒ {tokens} tokens)", style="#ff8c42")
                 if visible: live.update(Group(Text("● ", style="white", end=""), Markdown(visible), status))
                 else: live.update(Group(Text.from_markup(pet("think", "hmm...")), status))
-            reply = _answer(raw, model, deep)
+            reply = _answer(raw, model, deep, cut)
             live.update(Group(Text.from_markup(pet("happy", "done!")), Text("● Forge", style="bold white"), Markdown(reply),
                               Text(f"  ⎿ {tokens} tokens in {time.time()-start:.1f}s", style="dim")))
     except KeyboardInterrupt:
-        reply = _answer(raw, model, deep) + " [stopped]"
+        reply = _answer(raw, model, deep, True) + " [stopped]"
         console.print("[dim]  ⎿  Stopped ✋[/]")
     return reply
 
