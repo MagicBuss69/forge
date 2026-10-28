@@ -1,0 +1,12 @@
+memory/
+backups/
+tests/
+__pycache__/
+*.pyc
+*.json
+.typed-history
+.last-chat.json
+venv/
+.venv/
+env/
+ai-env/
