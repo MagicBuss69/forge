@@ -546,7 +546,7 @@ def undo():
             os.remove(f["path"]); tool_line("Undo", f["path"], "Deleted the file I created ↩️")
     os.remove(LAST_EDIT)
 
-def stream_reply(model, messages, deep=False, n=400):
+def stream_reply(model, messages, deep=False, n=2000):
     raw = ""; tokens = 0; start = time.time()
     try:
         with Live(console=console, refresh_per_second=8, transient=False) as live:
