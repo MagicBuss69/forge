@@ -1,6 +1,6 @@
 import glob, sys
 if any(a in ("-h", "--help") for a in sys.argv[1:]):
-    print("Forge - a local, offline AI coding assistant in your terminal (Ollama).\n"
+    print("Forge - a local, offline personal AI assistant in your terminal (Ollama).\n"
           "Usage: python forge.py\n"
           "Set your name with FORGE_USER=Name or ~/.forge/config.json {\"user_name\": \"Name\"}.\n"
           "Inside Forge type / for the command menu, /help for help, /bye to quit.")
@@ -103,7 +103,7 @@ def remember(msg):
     if "NONE" not in note and "|" in note:
         topic, fact = note.split("|", 1)
         if topic.strip().lower() not in ("about-me", "projects", "school"):
-            topic = "projects" if "game" in fact.lower() else "general"
+            topic = "general"
         f0 = fact.strip().rstrip(".").lower()
         if f0 in EXAMPLE_FACTS or f0 in load_mem().lower(): return
         t = save_mem(topic.strip(), fact.strip())
@@ -592,14 +592,14 @@ def replay(h, n=10):
     console.print("[dim]── continuing ─────────────────────────────[/]")
 
 def system_prompt():
-    return ("You are Forge, " + USER_NAME + "'s local coding assistant on their computer. You run fully offline through Ollama with model routing: " + CHAT_MODEL + " for normal chat, planning, reasoning and memory notes in ~/Forge/memory, and " + SMART_MODEL + " for code, reading files, explaining, edits and deep thinking. Be friendly and direct, explain simply like a teacher, show code in small pieces, use emojis now and then. Never make up facts or code; say you don't know instead. Today is " + datetime.date.today().isoformat() + ".\n"
+    return ("You are Forge, " + USER_NAME + "'s personal AI assistant living on their computer. You help with anything: questions, school, Linux and the computer, ideas, writing, coding and projects. Treat every topic as equally welcome and answer the question actually asked; only bring up the user's projects when they ask about them. You run fully offline through Ollama with model routing: " + CHAT_MODEL + " for normal chat, planning, reasoning and memory notes in ~/Forge/memory, and " + SMART_MODEL + " for code, reading files, explaining, edits and deep thinking. Be friendly and direct, explain simply like a teacher, show code in small pieces, use emojis now and then. Never make up facts or code; say you don't know instead. Today is " + datetime.date.today().isoformat() + ".\n"
         "Your tools (Forge's code runs them, you never run anything yourself):\n"
         "- Shell: if you need a command's output to answer (disk space, files in a folder, versions), reply with ONLY one line `RUN: <command>`. Forge shows it to the user, asks y/n, and gives you the output. Never pretend you ran a command or know its output before you get it.\n"
         "- Files: Forge reads files the user mentions and searches this folder for code questions; results appear in the user's message.\n"
         "- Edits: Forge edits or creates files when the user starts with fix/change/add/create and names files; you don't edit in chat.\n"
         "- Web: when the user's message contains web search results, use them and cite links as [title](url). Without results you have no internet info.\n"
         + FEATURES + "\nWhen the user asks what you can do or about a feature, answer from this list.\n"
-        "Keep answers short. When explaining a file, only describe what is actually written in it and name the function or line. Your memory notes about the user:\n" + load_mem())
+        "Keep answers short. When explaining a file, only describe what is actually written in it and name the function or line. Your memory notes about the user (background only; use a note only when it is relevant to the current question, never steer the chat toward them):\n" + load_mem())
 
 def main():
     global session, history
