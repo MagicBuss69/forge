@@ -1,6 +1,6 @@
 # 🔥 Forge
 
-**Forge** is a friendly personal AI assistant that lives in your terminal. Ask it anything (questions, homework, Linux help, ideas, writing) and it can also code, edit files and run tasks for you. It and runs **100% locally and offline** through [Ollama](https://ollama.com). No cloud, no API keys, everything stays on your machine.
+**Forge** is a friendly personal AI assistant that lives in your terminal. Ask it anything (questions, homework, Linux help, ideas, writing) and it can also code, edit files and run tasks for you. It runs **100% locally and offline** through [Ollama](https://ollama.com). No cloud, no API keys, everything stays on your machine.
 
 ## ✨ Features
 
