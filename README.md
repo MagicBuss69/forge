@@ -6,7 +6,9 @@
 
 - **Slash menu** – type `/` to get a pop-up menu of commands.
 - **Natural-language commands** – say things like "undo that", "start over", "which model", "show my todo" instead of slash commands.
-- **Model routing** – `qwen3:1.7b` for fast chat and planning, `qwen3:8b` for code, file reading, edits and deep thinking.
+- **Model routing**: a model per role, chat (fast answers), code (code, files, edits, deep thinking) and plan (to-do lists). Defaults: `qwen3:1.7b` chat/plan, `qwen3:8b` code.
+- **`/model`**: shows the model for each role and your installed models. `/model chat <name>` / `/model code <name>` / `/model plan <name>` switch a role (saved in `~/.forge/config.json`). `/model suggest` detects your RAM, GPU and VRAM and recommends models that fit, with the `ollama pull` commands.
+- **Windows, Linux and macOS**: colors and emoji in Windows Terminal/PowerShell, commands run in PowerShell on Windows and bash elsewhere.
 - **Deep-think** – `/deep` makes Forge reason step by step.
 - **Commands**: `/run` (shell command, asks y/n), `/search` (search the project), `/web` (web search with links), `/plan` & `/todo` (task lists), `/agent` (works on a task by itself, asking before changes), `/read`, `/undo`, `/model`, `/clear`, `/help`, `/bye`.
 - **Multi-file edits** with a diff preview and **y/n** confirmation, with automatic backups and `/undo`.
@@ -32,6 +34,21 @@
    python forge.py
    ```
 
+## 🪟 Windows 10/11 install
+
+1. Install [Python 3.10+](https://www.python.org/downloads/) (tick "Add to PATH"), [Git](https://git-scm.com/) and [Ollama](https://ollama.com/download).
+2. In PowerShell:
+   ```powershell
+   git clone https://github.com/MagicBuss69/forge $HOME\Forge
+   cd $HOME\Forge
+   powershell -ExecutionPolicy Bypass -File install.ps1
+   ```
+   This creates a venv in `%USERPROFILE%\ai-env`, installs the packages, adds a `forge` function to your PowerShell `$PROFILE` (setting the CurrentUser execution policy to RemoteSigned if profiles are blocked) and puts a `forge.cmd` fallback in `%USERPROFILE%\.forge\bin` on your user PATH.
+3. Open a **new** Windows Terminal / PowerShell tab and type `forge`.
+4. Inside Forge, run `/model suggest` to see which models fit your PC, then `ollama pull` them and set them with `/model chat ...` / `/model code ...`.
+
+Forge starts `ollama serve` in the background (no window) if it isn't already running. Data lives in `%USERPROFILE%\Forge\memory`, `backups` and `tests`.
+
 ## ⚙️ Config
 
 Forge calls you "friend" by default. Set your name with an environment variable:
@@ -40,9 +57,9 @@ export FORGE_USER="YourName"
 ```
 or in `~/.forge/config.json`:
 ```json
-{"user_name": "YourName"}
+{"user_name": "YourName", "models": {"chat": "qwen3:4b", "code": "qwen3:14b", "plan": "qwen3:14b"}}
 ```
-Forge uses `ollama` from your PATH (falls back to `~/.local/ollama/bin/ollama`) and starts it automatically if it isn't running. Memory and backups are stored in `~/Forge/memory` and `~/Forge/backups` (created automatically).
+Forge uses `ollama` from your PATH (falls back to the standard install locations) and starts it automatically if it isn't running. Memory and backups are stored in `~/Forge/memory` and `~/Forge/backups` (created automatically).
 
 ## 🔒 Offline & private
 

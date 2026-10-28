@@ -1,10 +1,30 @@
-import glob, sys
+import glob, sys, os, platform
+from pathlib import Path
+IS_WIN = os.name == "nt"
+def _setup_console():
+    """UTF-8 output and ANSI colors on Windows Terminal / PowerShell / cmd."""
+    for st in (sys.stdout, sys.stderr):
+        try: st.reconfigure(encoding="utf-8", errors="replace")
+        except Exception: pass
+    if IS_WIN:
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            k.SetConsoleOutputCP(65001); k.SetConsoleCP(65001)
+            h = k.GetStdHandle(-11); mode = ctypes.c_uint32()
+            if k.GetConsoleMode(h, ctypes.byref(mode)): k.SetConsoleMode(h, mode.value | 0x0004)
+        except Exception: pass
+_setup_console()
 if any(a in ("-h", "--help") for a in sys.argv[1:]):
     print("Forge - a local, offline personal AI assistant in your terminal (Ollama).\n"
-          "Usage: python forge.py\n"
+          "Usage: python forge.py   (Windows: py forge.py)\n"
           "Set your name with FORGE_USER=Name or ~/.forge/config.json {\"user_name\": \"Name\"}.\n"
           "Inside Forge type / for the command menu, /help for help, /bye to quit.")
     sys.exit(0)
+_SERVER_ENV = dict(os.environ)
+# OLLAMA_HOST=0.0.0.0 is fine for the server but not as an address to connect to (WinError 10049 on Windows)
+_oh = os.environ.get("OLLAMA_HOST", "")
+if _oh.replace("http://", "").startswith("0.0.0.0"): os.environ["OLLAMA_HOST"] = _oh.replace("0.0.0.0", "127.0.0.1")
 import ollama, json, os, re, datetime, threading, time, subprocess, shutil, urllib.request, urllib.parse, html as htmlmod
 from rich.console import Console
 from rich.markdown import Markdown
@@ -20,7 +40,7 @@ TB_STYLE = Style.from_dict({'bottom-toolbar': 'noreverse bg:default fg:#888888',
     'completion-menu': 'bg:#2b2b2b fg:#dddddd', 'completion-menu.completion.current': 'bg:#ff8c42 fg:#000000 bold',
     'completion-menu.meta.completion': 'bg:#2b2b2b fg:#888888', 'completion-menu.meta.completion.current': 'bg:#ff8c42 fg:#000000'})
 from prompt_toolkit.completion import Completer, Completion
-CMDS = {"/help": "show all commands", "/clear": "start a fresh chat", "/model": "which model does what",
+CMDS = {"/help": "show all commands", "/clear": "start a fresh chat", "/model": "show/change models per role, /model suggest",
         "/undo": "undo my last file edit(s)", "/deep": "think step by step", "/run": "run a shell command (asks y/n)",
         "/search": "search this project's files", "/web": "search the internet", "/plan": "make a to-do list for a task",
         "/todo": "show the current to-do list", "/agent": "let me work on a task by myself (asks before changes)",
@@ -33,60 +53,81 @@ class CmdCompleter(Completer):
                 if c.startswith(t): yield Completion(c, start_position=-len(t), display_meta=d)
 
 import subprocess as _sp, urllib.request as _ur
+HOME = Path.home()
+FORGE_DIR = HOME / "Forge"
+CONFIG_FILE = HOME / ".forge" / "config.json"
+def load_config():
+    try: return json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
+    except Exception: return {}
+def save_config(**kv):
+    cfg = load_config(); cfg.update(kv)
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 def _load_user_name():
-    name = os.environ.get("FORGE_USER", "").strip()
-    if not name:
-        try:
-            with open(os.path.expanduser("~/.forge/config.json")) as f:
-                name = str(json.load(f).get("user_name", "")).strip()
-        except Exception: name = ""
+    name = os.environ.get("FORGE_USER", "").strip() or str(load_config().get("user_name", "")).strip()
     return name or "friend"
 USER_NAME = _load_user_name()
 def ollama_bin():
-    return shutil.which("ollama") or os.path.expanduser("~/.local/ollama/bin/ollama")
+    found = shutil.which("ollama")
+    if found: return found
+    for c in ([Path(os.environ.get("LOCALAPPDATA", HOME / "AppData/Local")) / "Programs/Ollama/ollama.exe"] if IS_WIN
+              else [HOME / ".local/ollama/bin/ollama", Path("/usr/local/bin/ollama"), Path("/opt/homebrew/bin/ollama")]):
+        if c.exists(): return str(c)
+    return "ollama"
 def ensure_ollama():
     try: _ur.urlopen("http://127.0.0.1:11434/api/version", timeout=2); return
     except Exception: pass
     print("🔥 Starting Ollama...")
-    _sp.Popen([ollama_bin(), "serve"], stdout=open(os.path.expanduser("~/.ollama-serve.log"), "a"), stderr=_sp.STDOUT, start_new_session=True)
+    log = open(HOME / ".ollama-serve.log", "a")
+    try:
+        if IS_WIN:
+            _sp.Popen([ollama_bin(), "serve"], stdout=log, stderr=_sp.STDOUT, stdin=_sp.DEVNULL, env=_SERVER_ENV,
+                      creationflags=_sp.CREATE_NO_WINDOW | _sp.DETACHED_PROCESS | _sp.CREATE_NEW_PROCESS_GROUP)
+        else:
+            _sp.Popen([ollama_bin(), "serve"], stdout=log, stderr=_sp.STDOUT, stdin=_sp.DEVNULL, env=_SERVER_ENV, start_new_session=True)
+    except Exception as e:
+        print(f"Could not start Ollama ({e}). Install it from https://ollama.com"); return
     for _ in range(30):
         time.sleep(0.5)
         try: _ur.urlopen("http://127.0.0.1:11434/api/version", timeout=2); return
         except Exception: pass
 ensure_ollama()
 console = Console()
-CHAT_MODEL = "qwen3:1.7b"
-MEM_MODEL = "qwen3:1.7b"
-SMART_MODEL = "qwen3:8b"
+DEFAULT_MODELS = {"chat": "qwen3:1.7b", "code": "qwen3:8b", "plan": "qwen3:1.7b"}
+_cfgm = load_config().get("models", {})
+CHAT_MODEL = _cfgm.get("chat", DEFAULT_MODELS["chat"])
+SMART_MODEL = _cfgm.get("code", DEFAULT_MODELS["code"])
+PLAN_MODEL = _cfgm.get("plan", DEFAULT_MODELS["plan"])
+MEM_MODEL = CHAT_MODEL
 CODE_WORDS = ("code","bug","error","function","script","python","c#","class","loop","variable","traceback")
-EDIT_MODEL = "qwen3:8b"
+EDIT_MODEL = SMART_MODEL
 REASON_WORDS = ("why","how","explain","plan","compare","should","what if","difference","best","idea","think")
 def route(msg, has_file):
     m = msg.lower()
     if has_file or any(w in m for w in CODE_WORDS): return SMART_MODEL, "code"
     if any(w in m for w in REASON_WORDS): return CHAT_MODEL, "reasoning"
     return CHAT_MODEL, "chat"
-MEMDIR = os.path.expanduser("~/Forge/memory")
-os.makedirs(MEMDIR, exist_ok=True)
-os.makedirs(os.path.expanduser("~/Forge/backups"), exist_ok=True)
+MEMDIR = str(FORGE_DIR / "memory")
+BACKUP_DIR = str(FORGE_DIR / "backups")
+for _d in ("memory", "backups", "tests"): (FORGE_DIR / _d).mkdir(parents=True, exist_ok=True)
 
-OLD = os.path.expanduser("~/memories.json")
+OLD = str(HOME / "memories.json")
 if os.path.exists(OLD) and not os.listdir(MEMDIR):
-    with open(os.path.join(MEMDIR, "general.md"), "w") as f:
-        f.write("# general\n" + "".join("- " + m + "\n" for m in json.load(open(OLD))))
+    with open(os.path.join(MEMDIR, "general.md"), "w", encoding="utf-8") as f:
+        f.write("# general\n" + "".join("- " + m + "\n" for m in json.load(open(OLD, encoding="utf-8"))))
 
 def load_mem():
     text = ""
     for name in sorted(os.listdir(MEMDIR)):
         if name.endswith(".md"):
-            text += open(os.path.join(MEMDIR, name)).read() + "\n"
+            text += open(os.path.join(MEMDIR, name), encoding="utf-8", errors="replace").read() + "\n"
     return text
 
 def save_mem(topic, fact):
     topic = re.sub(r"[^a-z0-9-]", "", topic.lower().replace(" ", "-")) or "general"
     path = os.path.join(MEMDIR, topic + ".md")
     new = not os.path.exists(path)
-    with open(path, "a") as f:
+    with open(path, "a", encoding="utf-8") as f:
         if new: f.write("# " + topic + "\n")
         f.write("- " + fact + "\n")
     return topic
@@ -129,7 +170,7 @@ def pet(mood, say=""):
     return "\n".join(lines)
 
 def read_file(path):
-    text = open(path, errors="replace").read()[:6000]
+    text = open(path, encoding="utf-8", errors="replace").read()[:6000]
     console.print(f"[green]●[/] [bold]Read[/]([cyan]{path}[/])\n  [dim]⎿  Read {text.count(chr(10))+1} lines[/]")
     return text
 
@@ -145,15 +186,20 @@ def ask_yn(q, allow_all=False):
 def tool_line(name, arg, note="", color="green"):
     console.print(f"[{color}]●[/] [bold]{name}[/]([cyan]{arg}[/])" + (f"\n  [dim]⎿  {note}[/]" if note else ""), highlight=False)
 
+SHELL_NAME = "PowerShell" if IS_WIN else "Bash"
 # ---------- 4. shell commands ----------
 def run_cmd(cmd, auto=False, header=True):
     """Show ● Bash(cmd), ask y/n, run it. Returns output text, or None if the user said no."""
     from rich.markup import escape
-    if header: console.print(f"[green]●[/] [bold]Bash[/]([cyan]{escape(cmd)}[/])", highlight=False)
+    if header: console.print(f"[green]●[/] [bold]{SHELL_NAME}[/]([cyan]{escape(cmd)}[/])", highlight=False)
     if not auto and ask_yn("⚡ Run this command?") != "y":
         console.print("[dim]  ⎿  Skipped, nothing was run.[/]"); return None
     try:
-        p = subprocess.run(cmd, shell=True, cwd=os.getcwd(), capture_output=True, text=True, timeout=60, errors="replace")
+        if IS_WIN:
+            p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd], cwd=os.getcwd(), capture_output=True,
+                               text=True, timeout=60, encoding="utf-8", errors="replace", creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            p = subprocess.run(cmd, shell=True, cwd=os.getcwd(), capture_output=True, text=True, timeout=60, errors="replace")
         out = (p.stdout + p.stderr).rstrip() + ("" if p.returncode == 0 else f"\n(exit code {p.returncode})")
     except subprocess.TimeoutExpired:
         out = "(stopped: took longer than 60 seconds)"
@@ -169,10 +215,11 @@ def run_cmd(cmd, auto=False, header=True):
 def extract_commands(reply):
     """Find commands the model proposed: ```bash blocks or RUN: lines."""
     cmds = []
-    for block in re.findall(r"```(?:bash|sh|shell|console)\s*\n(.*?)```", reply, re.S):
+    for block in re.findall(r"```(?:bash|sh|shell|console|powershell|pwsh|ps1|ps|cmd|bat)\s*\n(.*?)```", reply, re.S):
         for l in block.splitlines():
             l = l.strip()
             if l.startswith("$ "): l = l[2:]
+            if l.startswith("PS> "): l = l[4:]
             if l and not l.startswith("#"): cmds.append(l)
     for m in re.findall(r"(?m)^\s*\**RUN:\**\s*`?(.+?)`?\s*$", reply):
         cmds.append(m.strip())
@@ -231,7 +278,8 @@ def project_search(query, root=None, show=True):
     if show: tool_line("Search", '"' + " ".join(kws) + '"', f"Found {len(results)} file{'s' if len(results)!=1 else ''}")
     note = ""
     for hits, score, path, text in results[:4]:
-        rel = os.path.relpath(path, root)
+        try: rel = os.path.relpath(path, root)
+        except ValueError: rel = path
         snips = [f"{i+1}: {l.strip()[:160]}" for i, l in enumerate(text.splitlines()) if any(k.lower() in l.lower() for k in kws)][:6]
         if show: console.print(Text(f"     {rel}", style="dim"))
         note += f"\n--- {rel} ---\n" + "\n".join(snips)
@@ -293,7 +341,7 @@ def parse_plan(text):
 def make_plan(task):
     global TODO
     with console.status("[#ff8c42]✻ Planning…[/]"):
-        out = ollama.chat(model=CHAT_MODEL, think=False, keep_alive="30m", options={"num_predict": 300}, messages=[{"role": "user", "content":
+        out = ollama.chat(model=PLAN_MODEL, think=False, keep_alive="30m", options={"num_predict": 300}, messages=[{"role": "user", "content":
             "Make a short checklist (3 to 6 steps) to do this task: " + task + "\nReply ONLY with a numbered list, one short step (under 10 words) per line. /no_think"}])["message"]["content"]
     steps = parse_plan(out) or [task[:90]]
     TODO = [{"text": s, "done": False} for s in steps]
@@ -348,29 +396,29 @@ def apply_changes(changes, auto=False):
         elif ask_yn("Apply this change?") != "y": chosen = []
     if not chosen:
         console.print("[dim]  ⎿  Skipped, nothing changed.[/]"); return []
-    bdir = os.path.expanduser("~/Forge/backups"); os.makedirs(bdir, exist_ok=True)
+    bdir = BACKUP_DIR; os.makedirs(bdir, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S"); record = []
     for path in chosen:
         old, new = changes[path]
         bak = None
         if old is not None:
             bak = os.path.join(bdir, datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S") + "_" + os.path.basename(path))
-            open(bak, "w").write(old)
+            open(bak, "w", encoding="utf-8", newline="").write(old)
             same = sorted(glob.glob(os.path.join(bdir, "*_" + os.path.basename(path))))
             for extra in same[:-10]: os.remove(extra)
         else:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        open(path, "w").write(new); record.append({"path": path, "bak": bak})
+        open(path, "w", encoding="utf-8", newline="").write(new); record.append({"path": path, "bak": bak})
         console.print(f"[green]●[/] {'Created' if bak is None else 'Saved'} [cyan]{path}[/]" + (f" · backup [cyan]{bak}[/]" if bak else "") + " 🔥")
         if path.endswith(".py"):
             try: py_compile.compile(path, doraise=True); console.print("[dim]  ⎿  Still runs (compiles fine) ✅[/]")
             except Exception as e:
                 if os.path.abspath(path) == os.path.abspath(__file__) and bak:
-                    open(path, "w").write(old); console.print(f"[red]●[/] That change to my own code broke me ({e}), so I put my old code back. 🛡️"); continue
+                    open(path, "w", encoding="utf-8", newline="").write(old); console.print(f"[red]●[/] That change to my own code broke me ({e}), so I put my old code back. 🛡️"); continue
                 console.print(f"[red]●[/] Warning: it doesn't compile now: {e}. /undo can revert it.")
         if os.path.abspath(path) == os.path.abspath(__file__):
             console.print("[#ffd166]  ⎿  I upgraded myself! Type /bye and start forge again to load it. 🔥[/]")
-    json.dump({"files": record}, open(LAST_EDIT, "w"))
+    json.dump({"files": record}, open(LAST_EDIT, "w", encoding="utf-8"))
     return chosen
 
 def relevant_parts(text, msg, limit=10000):
@@ -389,7 +437,7 @@ def do_edit(paths, msg, auto=False):
     if isinstance(paths, str): paths = [paths]
     files = {}
     for p in paths:
-        t = open(p, errors="replace").read()
+        t = open(p, encoding="utf-8", errors="replace").read()
         if len(t) > 12000:
             t = relevant_parts(t, msg)
             console.print(f"[dim]  ⎿  {os.path.basename(p)} is big, so I'm only looking at the parts that match your request[/]")
@@ -410,7 +458,7 @@ def apply_model_edit(out, paths, auto=False):
         real = resolve(p, paths)
         if not os.path.isfile(real):
             console.print(f"[red]●[/] I tried to edit {p} but it doesn't exist, skipping it."); continue
-        old = open(real, errors="replace").read(); txt = old
+        old = open(real, encoding="utf-8", errors="replace").read(); txt = old
         for s, r in blocks:
             if txt.count(s) != 1:
                 console.print(f"[red]●[/] My edit for {p} didn't match the file exactly, so I changed nothing there."); txt = None; break
@@ -482,7 +530,7 @@ def agent(task, max_steps=8):
             elif verb == "run":
                 if not auto:
                     from rich.markup import escape
-                    console.print(f"[green]●[/] [bold]Bash[/]([cyan]{escape(arg)}[/])", highlight=False)
+                    console.print(f"[green]●[/] [bold]{SHELL_NAME}[/]([cyan]{escape(arg)}[/])", highlight=False)
                     a = ask_yn("⚡ Run this command?", allow_all=True)
                     if a == "a": auto = True
                     if a == "n": result = "the user said no to running this command."; console.print("[dim]  ⎿  Skipped.[/]")
@@ -513,12 +561,14 @@ def big_task(msg):
     m = msg.lower()
     return len(msg.split()) >= 8 and any(w in m for w in BIG_WORDS)
 
-CHAT_FILE = os.path.expanduser("~/Forge/memory/.last-chat.json")
-LAST_EDIT = os.path.expanduser("~/Forge/backups/.last-edit.json")
+CHAT_FILE = str(FORGE_DIR / "memory" / ".last-chat.json")
+LAST_EDIT = str(FORGE_DIR / "backups" / ".last-edit.json")
 HELP = """[bold #ff8c42]Forge commands[/]
   [cyan]/help[/]           show this list
   [cyan]/clear[/]          start a fresh chat
-  [cyan]/model[/]          show which model does what
+  [cyan]/model[/]          models per role + installed models
+  [cyan]/model chat|code|plan <name>[/]  change a role (saved)
+  [cyan]/model suggest[/]  recommend models for this PC's RAM/GPU
   [cyan]/undo[/]           undo my last edit (all files; deletes files I created)
   [cyan]/deep[/] <q>       think step by step (or say y when I ask)
   [cyan]/run[/] <cmd>      run a shell command (I always ask y/n first) ⚡
@@ -533,18 +583,99 @@ HELP = """[bold #ff8c42]Forge commands[/]
   Mention a file to read it · start with fix/change/add/create + file name(s) to edit or create files
   Ask about code without a file and I'll search this folder · say latest/news/today/price to search the web"""
 def save_chat(h):
-    if h: json.dump(h[-20:], open(CHAT_FILE, "w"))
+    if h: json.dump(h[-20:], open(CHAT_FILE, "w", encoding="utf-8"))
 def undo():
     if not os.path.exists(LAST_EDIT):
         console.print("[dim]  ⎿  Nothing to undo.[/]"); return
-    e = json.load(open(LAST_EDIT))
+    e = json.load(open(LAST_EDIT, encoding="utf-8"))
     for f in e.get("files", [e]):
         if f.get("bak"):
-            open(f["path"], "w").write(open(f["bak"]).read())
+            open(f["path"], "w", encoding="utf-8", newline="").write(open(f["bak"], encoding="utf-8").read())
             tool_line("Undo", f["path"], f"Restored from {f['bak']} ↩️")
         elif os.path.exists(f["path"]):
             os.remove(f["path"]); tool_line("Undo", f["path"], "Deleted the file I created ↩️")
     os.remove(LAST_EDIT)
+
+# ---------- /model ----------
+def installed_models():
+    try:
+        r = ollama.list()
+        ms = r.get("models", []) if isinstance(r, dict) else getattr(r, "models", [])
+        return sorted((m.get("model") or m.get("name")) if isinstance(m, dict) else (getattr(m, "model", None) or getattr(m, "name", "")) for m in ms)
+    except Exception: return []
+
+def _norm(n): return n if ":" in n else n + ":latest"
+
+def detect_hardware():
+    """Returns dict(ram_gb, gpu, vram_gb). Works on Windows, Linux and macOS; never raises."""
+    ram = 0.0
+    try:
+        if IS_WIN:
+            import ctypes
+            class MS(ctypes.Structure):
+                _fields_ = [("l", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong), ("avail", ctypes.c_ulonglong),
+                            ("tp", ctypes.c_ulonglong), ("ap", ctypes.c_ulonglong), ("tv", ctypes.c_ulonglong), ("av", ctypes.c_ulonglong), ("ae", ctypes.c_ulonglong)]
+            m = MS(); m.l = ctypes.sizeof(MS); ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)); ram = m.total / 2**30
+        elif sys.platform == "darwin":
+            ram = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5).stdout) / 2**30
+        else:
+            ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+    except Exception: pass
+    gpu, vram = None, 0.0
+    smi = shutil.which("nvidia-smi") or (r"C:\Windows\System32\nvidia-smi.exe" if IS_WIN and os.path.exists(r"C:\Windows\System32\nvidia-smi.exe") else None)
+    if smi:
+        try:
+            out = subprocess.run([smi, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+            if out:
+                name, mem = out[0].rsplit(",", 1); gpu, vram = name.strip(), float(mem) / 1024
+        except Exception: pass
+    if not gpu and sys.platform == "darwin" and platform.machine() == "arm64":
+        gpu, vram = "Apple Silicon (unified memory)", ram * 0.65
+    return {"ram_gb": round(ram, 1), "gpu": gpu, "vram_gb": round(vram, 1)}
+
+def suggest_models(hw):
+    v, ram = hw["vram_gb"], hw["ram_gb"]
+    if v >= 16: return {"chat": "qwen3:4b", "code": "qwen3:14b", "plan": "qwen3:14b"}
+    if v >= 12: return {"chat": "qwen3:4b", "code": "qwen3:8b", "plan": "qwen3:8b"}
+    if v >= 8: return {"chat": "qwen3:4b", "code": "qwen3:8b", "plan": "qwen3:4b"}
+    if v >= 4: return {"chat": "qwen3:1.7b", "code": "qwen3:4b", "plan": "qwen3:4b"}
+    if ram >= 16: return {"chat": "qwen3:1.7b", "code": "qwen3:4b", "plan": "qwen3:1.7b"}  # CPU only
+    return {"chat": "qwen3:1.7b", "code": "qwen3:1.7b", "plan": "qwen3:1.7b"}
+
+ROLE_DESC = {"chat": "chat, reasoning, memory notes", "code": "code, files, explaining, edits, deep thinking, agent", "plan": "to-do lists and plans"}
+def model_cmd(arg):
+    global CHAT_MODEL, SMART_MODEL, EDIT_MODEL, PLAN_MODEL, MEM_MODEL
+    parts = arg.split()
+    inst = installed_models(); inst_n = {_norm(m) for m in inst}
+    cur = {"chat": CHAT_MODEL, "code": SMART_MODEL, "plan": PLAN_MODEL}
+    if not parts:
+        console.print("[bold #ff8c42]Models per role[/]")
+        for r, m in cur.items():
+            ok = "" if _norm(m) in inst_n else " [red](not installed: ollama pull " + m + ")[/]"
+            console.print(f"  [cyan]{r:5}[/] {m}{ok}  [dim]{ROLE_DESC[r]}[/]")
+        console.print("[bold #ff8c42]Installed[/]  " + (", ".join(inst) if inst else "[red]none found (is Ollama running?)[/]"))
+        console.print("[dim]  ⎿  /model chat|code|plan <name> to change · /model suggest for this computer[/]"); return
+    if parts[0] == "suggest":
+        hw = detect_hardware(); sug = suggest_models(hw)
+        g = f"{hw['gpu']} ({hw['vram_gb']} GB VRAM)" if hw["gpu"] else "no NVIDIA GPU found, CPU only"
+        console.print(f"[bold #ff8c42]Your computer[/]  RAM {hw['ram_gb']} GB · GPU {g}")
+        pulls = []
+        for r, m in sug.items():
+            have = _norm(m) in inst_n
+            if not have and m not in pulls: pulls.append(m)
+            console.print(f"  [cyan]{r:5}[/] {m}  " + ("[green]installed ✅[/]" if have else "[yellow]not installed[/]") + f"  [dim]{ROLE_DESC[r]}[/]")
+        if pulls: console.print("[dim]  ⎿  Get them with:[/] " + " ; ".join("ollama pull " + m for m in pulls))
+        console.print("[dim]  ⎿  Then set them with e.g. /model code " + sug["code"] + "[/]"); return
+    if parts[0] in ("chat", "code", "plan", "think") and len(parts) == 2:
+        role = "plan" if parts[0] == "think" else parts[0]; name = parts[1]
+        if inst and _norm(name) not in inst_n:
+            console.print(f"[yellow]●[/] {name} isn't installed yet. Run: ollama pull {name}  (saved anyway)")
+        if role == "chat": CHAT_MODEL = MEM_MODEL = name
+        elif role == "code": SMART_MODEL = EDIT_MODEL = name
+        else: PLAN_MODEL = name
+        models = load_config().get("models", {}); models[role] = name; save_config(models=models)
+        console.print(f"[green]●[/] {role} model is now [cyan]{name}[/] [dim](saved in {CONFIG_FILE})[/]"); return
+    console.print("[dim]  ⎿  Usage: /model · /model chat|code|plan <name> · /model suggest[/]")
 
 def stream_reply(model, messages, deep=False, n=2000):
     raw = ""; tokens = 0; start = time.time()
@@ -569,16 +700,18 @@ SPIN = "✻✶✷✸✹✺"
 session = None
 
 FEATURES = """Everything Forge can do (keep this list up to date):
-- Chat with model routing (1.7b fast chat/plans, 8b code/explaining/edits/deep), offers deeper thinking with y/n on tricky questions (/deep).
+- Chat with model routing by role: a chat model (normal chat, reasoning, memory notes), a code model (code, files, explaining, edits, deep thinking, agent) and a plan model (to-do lists). Offers deeper thinking with y/n on tricky questions (/deep).
 - Memory notes about the user saved automatically in ~/Forge/memory.
 - Saved chats: every chat is saved; on start Forge asks 'Continue our last chat?' and, on y, shows the previous messages and continues. /clear or 'start over' starts fresh.
 - Reads files the user mentions; searches the project for code questions (/search); web search with links (/web, or automatic for latest/news/today/price).
 - Runs shell commands after y/n (/run, or suggests RUN: lines).
-- Everything lives in ~/Forge (forge.py, memory/, backups/, tests/). Backups are named date_time_filename and only the newest 10 per file are kept.
+- Data lives in ~/Forge (memory/, backups/, tests/; on Windows C:\\Users\\<you>\\Forge). Backups are named date_time_filename and only the newest 10 per file are kept.
 - Edits and creates one or more files with a preview and y/n, backups in ~/Forge/backups, /undo or 'undo that' reverts the last edit.
 - To-do lists (/plan, /todo, or offered automatically for multi-step tasks); agent mode (/agent) works step by step on its own with y/n/a approvals.
 - Natural words work instead of commands ('undo that', 'start over', 'which model', 'show my todo', 'what can you do', 'bye forge'); typing / opens a command menu.
-- Starts Ollama by itself if it isn't running. Ctrl+C stops an answer. Has a pet: Forge the anvil with a flame.
+- /model shows the model used for each role (chat, code, plan) and the installed models; '/model chat <name>', '/model code <name>' and '/model plan <name>' change a role (saved in ~/.forge/config.json); '/model suggest' detects RAM, GPU and VRAM (nvidia-smi, Apple Silicon, or CPU only) and recommends models that fit, says which are installed and gives the 'ollama pull' command for the rest.
+- Works on Windows 10/11 (PowerShell / Windows Terminal, colors and emoji, `forge` command via install.ps1), Linux and macOS. On Windows /run and suggested commands run in PowerShell; on Linux/macOS in bash.
+- Starts Ollama by itself if it isn't running (hidden background process on Windows). Ctrl+C stops an answer. Has a pet: Forge the anvil with a flame.
 - Typing predictions: grey ghost text finishes what the user types based on what they typed before; → accepts it, ↑ shows older messages.
 - Can upgrade himself: when the user says e.g. 'add X to yourself', Forge edits his own forge.py with a preview and y/n, backs up first, and auto-restores if the change breaks him; then the user restarts forge."""
 
@@ -592,7 +725,8 @@ def replay(h, n=10):
     console.print("[dim]── continuing ─────────────────────────────[/]")
 
 def system_prompt():
-    return ("You are Forge, " + USER_NAME + "'s personal AI assistant living on their computer. You help with anything: questions, school, Linux and the computer, ideas, writing, coding and projects. Treat every topic as equally welcome and answer the question actually asked; only bring up the user's projects when they ask about them. You run fully offline through Ollama with model routing: " + CHAT_MODEL + " for normal chat, planning, reasoning and memory notes in ~/Forge/memory, and " + SMART_MODEL + " for code, reading files, explaining, edits and deep thinking. Be friendly and direct, explain simply like a teacher, show code in small pieces, use emojis now and then. Never make up facts or code; say you don't know instead. Today is " + datetime.date.today().isoformat() + ".\n"
+    return ("You are Forge, " + USER_NAME + "'s personal AI assistant living on their computer. You help with anything: questions, school, " + ("Windows" if IS_WIN else platform.system()) + " and the computer, ideas, writing, coding and projects. Treat every topic as equally welcome and answer the question actually asked; only bring up the user's projects when they ask about them. You run fully offline through Ollama with model routing: " + CHAT_MODEL + " for normal chat, " + PLAN_MODEL + " for planning, reasoning and memory notes in ~/Forge/memory, and " + SMART_MODEL + " for code, reading files, explaining, edits and deep thinking. Be friendly and direct, explain simply like a teacher, show code in small pieces, use emojis now and then. Never make up facts or code; say you don't know instead. Today is " + datetime.date.today().isoformat() + ".\n"
+        "The user's computer runs " + platform.system() + (": shell commands must be PowerShell" if IS_WIN else ": shell commands are bash") + ".\n"
         "Your tools (Forge's code runs them, you never run anything yourself):\n"
         "- Shell: if you need a command's output to answer (disk space, files in a folder, versions), reply with ONLY one line `RUN: <command>`. Forge shows it to the user, asks y/n, and gives you the output. Never pretend you ran a command or know its output before you get it.\n"
         "- Files: Forge reads files the user mentions and searches this folder for code questions; results appear in the user's message.\n"
@@ -609,11 +743,11 @@ def main():
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
     session = PromptSession(style=TB_STYLE, completer=CmdCompleter(), complete_while_typing=True,
-                            history=FileHistory(os.path.expanduser("~/Forge/memory/.typed-history")), auto_suggest=AutoSuggestFromHistory())
+                            history=FileHistory(str(FORGE_DIR / "memory" / ".typed-history")), auto_suggest=AutoSuggestFromHistory())
     history = []
     if os.path.exists(CHAT_FILE):
         try:
-            old_chat = json.load(open(CHAT_FILE))
+            old_chat = json.load(open(CHAT_FILE, encoding="utf-8"))
             if old_chat and yes(session.prompt(HTML(f"<ansiyellow>💬 Continue our last chat ({len(old_chat)//2} messages)? (y/n) </ansiyellow>"))):
                 history = old_chat; replay(history)
         except Exception: pass
@@ -667,8 +801,7 @@ def handle(msg):
     if msg == "/help": console.print(HELP); return True
     if msg == "/clear":
         history = []; console.print("[dim]  ⎿  Fresh chat started ✨[/]"); return True
-    if msg == "/model":
-        console.print(f"[bold #ff8c42]Routing[/]\n  {CHAT_MODEL}: chat, planning, reasoning, memory\n  {SMART_MODEL}: code, files, explaining, edits, deep thinking, agent"); return True
+    if cmd == "/model": model_cmd(arg); return True
     if msg == "/undo": undo(); return True
     if msg == "/todo": show_todo(); return True
     if cmd in ("/run", "/search", "/web", "/plan", "/agent") and not arg:

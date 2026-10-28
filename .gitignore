@@ -4,8 +4,11 @@ tests/
 __pycache__/
 *.pyc
 *.json
+config.json
+.forge/
 .typed-history
 .last-chat.json
+.last-edit.json
 venv/
 .venv/
 env/
