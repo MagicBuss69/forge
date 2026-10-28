@@ -40,7 +40,7 @@ TB_STYLE = Style.from_dict({'bottom-toolbar': 'noreverse bg:default fg:#888888',
     'completion-menu': 'bg:#2b2b2b fg:#dddddd', 'completion-menu.completion.current': 'bg:#ff8c42 fg:#000000 bold',
     'completion-menu.meta.completion': 'bg:#2b2b2b fg:#888888', 'completion-menu.meta.completion.current': 'bg:#ff8c42 fg:#000000'})
 from prompt_toolkit.completion import Completer, Completion
-CMDS = {"/help": "show all commands", "/clear": "start a fresh chat", "/model": "show/change models per role, /model suggest",
+CMDS = {"/help": "show all commands", "/clear": "start a fresh chat", "/model": "show/change models per role, /model suggest", "/predict": "typing predictions: ai, history or off",
         "/undo": "undo my last file edit(s)", "/deep": "think step by step", "/run": "run a shell command (asks y/n)",
         "/search": "search this project's files", "/web": "search the internet", "/plan": "make a to-do list for a task",
         "/todo": "show the current to-do list", "/agent": "let me work on a task by myself (asks before changes)",
@@ -568,6 +568,7 @@ HELP = """[bold #ff8c42]Forge commands[/]
   [cyan]/clear[/]          start a fresh chat
   [cyan]/model[/]          models per role + installed models
   [cyan]/model chat|code|plan <name>[/]  change a role (saved)
+  [cyan]/predict[/] ai|history|off  typing predictions (ghost text, → or Tab accepts)
   [cyan]/model suggest[/]  recommend models for this PC's RAM/GPU
   [cyan]/undo[/]           undo my last edit (all files; deletes files I created)
   [cyan]/deep[/] <q>       think step by step (or say y when I ask)
@@ -633,14 +634,93 @@ def detect_hardware():
         gpu, vram = "Apple Silicon (unified memory)", ram * 0.65
     return {"ram_gb": round(ram, 1), "gpu": gpu, "vram_gb": round(vram, 1)}
 
+BIG_MOE_OK = False  # qwen3:30b-a3b benchmarked on 16 GB VRAM + 32 GB RAM: spills to RAM, reloads ~17-33 s, reasons at length; 14b is the better default
 def suggest_models(hw):
     v, ram = hw["vram_gb"], hw["ram_gb"]
+    if v >= 16 and ram >= 32 and BIG_MOE_OK: return {"chat": "qwen3:4b", "code": "qwen3:30b-a3b", "plan": "qwen3:30b-a3b"}
     if v >= 16: return {"chat": "qwen3:4b", "code": "qwen3:14b", "plan": "qwen3:14b"}
     if v >= 12: return {"chat": "qwen3:4b", "code": "qwen3:8b", "plan": "qwen3:8b"}
     if v >= 8: return {"chat": "qwen3:4b", "code": "qwen3:8b", "plan": "qwen3:4b"}
     if v >= 4: return {"chat": "qwen3:1.7b", "code": "qwen3:4b", "plan": "qwen3:4b"}
     if ram >= 16: return {"chat": "qwen3:1.7b", "code": "qwen3:4b", "plan": "qwen3:1.7b"}  # CPU only
     return {"chat": "qwen3:1.7b", "code": "qwen3:1.7b", "plan": "qwen3:1.7b"}
+
+# ---------- live typing predictions ----------
+import asyncio
+from prompt_toolkit.auto_suggest import AutoSuggest, AutoSuggestFromHistory, Suggestion
+PREDICT_MODES = ("ai", "history", "off")
+FAST_MODELS = ("qwen3:1.7b", "qwen3:4b", "qwen3:0.6b")
+def default_predict_mode():
+    m = load_config().get("predict")
+    if m in PREDICT_MODES: return m
+    return "ai" if detect_hardware()["vram_gb"] >= 8 else "history"
+def predict_model():
+    m = load_config().get("predict_model")
+    if m: return m
+    inst = {_norm(x) for x in installed_models()}
+    return next((x for x in FAST_MODELS if _norm(x) in inst), CHAT_MODEL)
+PREDICT_MODE = None; PREDICT_MODEL = None; PREDICT_STATS = []
+_pclient = None
+
+def ai_continue(text, timeout=4.0):
+    """Ask the small model for the next few words of what the user is typing. Returns the text to append, or ''."""
+    global _pclient
+    if _pclient is None: _pclient = ollama.Client(timeout=timeout)
+    t0 = time.time()
+    try:
+        # raw ChatML prompt with an empty think block: no reasoning tokens, works on every Ollama version
+        out = _pclient.generate(model=PREDICT_MODEL, raw=True, keep_alive="30m",
+            prompt="<|im_start|>system\nYou autocomplete what a user is typing to their AI assistant. Reply with ONLY the next few words that continue "
+                   "their unfinished message, never repeat it, no quotes.<|im_end|>\n<|im_start|>user\nUnfinished message: " + text +
+                   "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nCompleted message: " + text,
+            options={"num_predict": 12, "temperature": 0.2, "stop": ["\n", "<|im_end|>"]})["response"]
+    except Exception: return ""
+    PREDICT_STATS.append(time.time() - t0)
+    out = out.split("</think>")[-1].replace("\n", " ").replace('"', "").rstrip()  # the model continues our text directly
+    if out.lower().strip().startswith(("we are given", "hmm", "okay", "the user")): return ""
+    if text.endswith(" "): out = out.lstrip()
+    return out[:80]
+
+class ForgeSuggest(AutoSuggest):
+    """History first (instant); AI fallback after a 350 ms pause. Never blocks typing: the request runs in a thread and
+    stale results (the text changed meanwhile) are thrown away, prompt_toolkit then asks again for the new text."""
+    def __init__(self, delay=0.35):
+        self.hist = AutoSuggestFromHistory(); self.delay = delay; self.cache = {}
+    def get_suggestion(self, buffer, document):
+        return None if PREDICT_MODE == "off" else self.hist.get_suggestion(buffer, document)
+    async def get_suggestion_async(self, buffer, document):
+        if PREDICT_MODE == "off": return None
+        s = self.hist.get_suggestion(buffer, document)
+        if s or PREDICT_MODE != "ai": return s
+        text = document.text
+        if len(text.strip()) < 3 or text.startswith("/") or not document.is_cursor_at_the_end or "\n" in text: return None
+        if text in self.cache: return Suggestion(self.cache[text]) if self.cache[text] else None
+        await asyncio.sleep(self.delay)
+        if buffer.document.text != text: return None          # user kept typing: stale
+        cont = await asyncio.get_running_loop().run_in_executor(None, ai_continue, text)
+        if len(self.cache) > 200: self.cache.clear()
+        self.cache[text] = cont
+        if buffer.document.text != text: return None          # stale answer, drop it
+        return Suggestion(cont) if cont else None
+
+def init_predict():
+    global PREDICT_MODE, PREDICT_MODEL
+    PREDICT_MODE = default_predict_mode(); PREDICT_MODEL = predict_model()
+    if PREDICT_MODE == "ai":
+        threading.Thread(target=ai_continue, args=("hello, can you",), daemon=True).start()  # warm up / keep loaded
+
+def predict_cmd(arg):
+    global PREDICT_MODE, PREDICT_MODEL
+    a = arg.split()
+    if a and a[0] in PREDICT_MODES:
+        PREDICT_MODE = a[0]; save_config(predict=PREDICT_MODE)
+        if len(a) > 1: PREDICT_MODEL = a[1]; save_config(predict_model=PREDICT_MODEL)
+        if PREDICT_MODE == "ai": threading.Thread(target=ai_continue, args=("hello, can you",), daemon=True).start()
+    elif a:
+        console.print("[dim]  ⎿  Usage: /predict ai [model] | history | off[/]"); return
+    desc = {"ai": f"history first, then AI ({PREDICT_MODEL}) after a short pause", "history": "from what you typed before", "off": "off"}[PREDICT_MODE]
+    lat = f" · AI avg {sum(PREDICT_STATS)/len(PREDICT_STATS)*1000:.0f} ms over {len(PREDICT_STATS)}" if PREDICT_STATS else ""
+    console.print(f"[green]●[/] Typing predictions: [cyan]{PREDICT_MODE}[/] [dim]({desc}; → or Tab accepts{lat})[/]")
 
 ROLE_DESC = {"chat": "chat, reasoning, memory notes", "code": "code, files, explaining, edits, deep thinking, agent", "plan": "to-do lists and plans"}
 def model_cmd(arg):
@@ -677,6 +757,16 @@ def model_cmd(arg):
         console.print(f"[green]●[/] {role} model is now [cyan]{name}[/] [dim](saved in {CONFIG_FILE})[/]"); return
     console.print("[dim]  ⎿  Usage: /model · /model chat|code|plan <name> · /model suggest[/]")
 
+_THINKS = {}
+def _thinks(m):  # thinking models (qwen3, deepseek-r1...) can write untagged reasoning before </think>
+    if m not in _THINKS:
+        try: _THINKS[m] = "thinking" in (ollama.show(m).get("capabilities") or [])
+        except Exception: _THINKS[m] = True
+    return _THINKS[m]
+def _answer(raw, model, deep):  # never return reasoning when </think> never came (ctrl-c or token cap)
+    if "</think>" in raw: return raw.split("</think>")[-1].strip()
+    if "<think>" in raw or (_thinks(model) and not deep): return "[stopped while thinking]"
+    return raw.strip()
 def stream_reply(model, messages, deep=False, n=2000):
     raw = ""; tokens = 0; start = time.time()
     try:
@@ -684,15 +774,15 @@ def stream_reply(model, messages, deep=False, n=2000):
             for chunk in ollama.chat(model=model, messages=messages, stream=True, think=deep, keep_alive="30m", options={"num_predict": 2000 if deep else n}):
                 raw += chunk["message"].get("content", "") or ""
                 tokens += 1
-                visible = raw.split("</think>")[-1].strip() if "</think>" in raw else ("" if "<think>" in raw else raw)
+                visible = raw.split("</think>")[-1].strip() if "</think>" in raw else ("" if "<think>" in raw or (_thinks(model) and not deep) else raw)
                 status = Text(f"{SPIN[tokens % len(SPIN)]} Forging… ({int(time.time()-start)}s · ⚒ {tokens} tokens)", style="#ff8c42")
                 if visible: live.update(Group(Text("● ", style="white", end=""), Markdown(visible), status))
                 else: live.update(Group(Text.from_markup(pet("think", "hmm...")), status))
-            reply = raw.split("</think>")[-1].strip()
+            reply = _answer(raw, model, deep)
             live.update(Group(Text.from_markup(pet("happy", "done!")), Text("● Forge", style="bold white"), Markdown(reply),
                               Text(f"  ⎿ {tokens} tokens in {time.time()-start:.1f}s", style="dim")))
     except KeyboardInterrupt:
-        reply = raw.split("</think>")[-1].strip() + " [stopped]"
+        reply = _answer(raw, model, deep) + " [stopped]"
         console.print("[dim]  ⎿  Stopped ✋[/]")
     return reply
 
@@ -712,7 +802,7 @@ FEATURES = """Everything Forge can do (keep this list up to date):
 - /model shows the model used for each role (chat, code, plan) and the installed models; '/model chat <name>', '/model code <name>' and '/model plan <name>' change a role (saved in ~/.forge/config.json); '/model suggest' detects RAM, GPU and VRAM (nvidia-smi, Apple Silicon, or CPU only) and recommends models that fit, says which are installed and gives the 'ollama pull' command for the rest.
 - Works on Windows 10/11 (PowerShell / Windows Terminal, colors and emoji, `forge` command via install.ps1), Linux and macOS. On Windows /run and suggested commands run in PowerShell; on Linux/macOS in bash.
 - Starts Ollama by itself if it isn't running (hidden background process on Windows). Ctrl+C stops an answer. Has a pet: Forge the anvil with a flame.
-- Typing predictions: grey ghost text finishes what the user types based on what they typed before; → accepts it, ↑ shows older messages.
+- Typing predictions: grey ghost text finishes what the user types; → or Tab accepts it (Tab still opens/cycles the / command menu when there's no prediction), ↑ shows older messages. History matches come first (instant); in AI mode a small fast model (qwen3:1.7b/4b) suggests the next words after a ~350 ms pause, in the background so typing never lags. /predict ai|history|off switches (saved in ~/.forge/config.json); AI mode is on by default only with a GPU of 8 GB+ VRAM, otherwise history only.
 - Can upgrade himself: when the user says e.g. 'add X to yourself', Forge edits his own forge.py with a preview and y/n, backs up first, and auto-restores if the change breaks him; then the user restarts forge."""
 
 def replay(h, n=10):
@@ -741,9 +831,15 @@ def main():
     console.print(pet("idle", "Hi " + USER_NAME + "! Forge here, let's build something. 🔥"))
     console.print(Panel(f"[bold]✻ Welcome to Forge![/]\n[dim]Models: {CHAT_MODEL} chat · {SMART_MODEL} code, explaining, edits & deep · /agent /run /web /search /plan · /help for commands[/]", border_style="#ff8c42", expand=False))
     from prompt_toolkit.history import FileHistory
-    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-    session = PromptSession(style=TB_STYLE, completer=CmdCompleter(), complete_while_typing=True,
-                            history=FileHistory(str(FORGE_DIR / "memory" / ".typed-history")), auto_suggest=AutoSuggestFromHistory())
+    init_predict()
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.filters import Condition
+    kb = KeyBindings()
+    @kb.add("tab", filter=Condition(lambda: bool(session and session.default_buffer.suggestion and not session.default_buffer.complete_state and session.default_buffer.document.is_cursor_at_the_end)))
+    def _accept_ghost(ev):  # Tab accepts the grey prediction (like →); without one Tab keeps its normal completion behaviour
+        b = ev.current_buffer; b.insert_text(b.suggestion.text)
+    session = PromptSession(style=TB_STYLE, completer=CmdCompleter(), complete_while_typing=True, key_bindings=kb,
+                            history=FileHistory(str(FORGE_DIR / "memory" / ".typed-history")), auto_suggest=ForgeSuggest())
     history = []
     if os.path.exists(CHAT_FILE):
         try:
@@ -802,6 +898,7 @@ def handle(msg):
     if msg == "/clear":
         history = []; console.print("[dim]  ⎿  Fresh chat started ✨[/]"); return True
     if cmd == "/model": model_cmd(arg); return True
+    if cmd == "/predict": predict_cmd(arg); return True
     if msg == "/undo": undo(); return True
     if msg == "/todo": show_todo(); return True
     if cmd in ("/run", "/search", "/web", "/plan", "/agent") and not arg:

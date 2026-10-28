@@ -10,10 +10,11 @@
 - **`/model`**: shows the model for each role and your installed models. `/model chat <name>` / `/model code <name>` / `/model plan <name>` switch a role (saved in `~/.forge/config.json`). `/model suggest` detects your RAM, GPU and VRAM and recommends models that fit, with the `ollama pull` commands.
 - **Windows, Linux and macOS**: colors and emoji in Windows Terminal/PowerShell, commands run in PowerShell on Windows and bash elsewhere.
 - **Deep-think** – `/deep` makes Forge reason step by step.
-- **Commands**: `/run` (shell command, asks y/n), `/search` (search the project), `/web` (web search with links), `/plan` & `/todo` (task lists), `/agent` (works on a task by itself, asking before changes), `/read`, `/undo`, `/model`, `/clear`, `/help`, `/bye`.
+- **Commands**: `/run` (shell command, asks y/n), `/search` (search the project), `/web` (web search with links), `/plan` & `/todo` (task lists), `/agent` (works on a task by itself, asking before changes), `/read`, `/undo`, `/model`, `/predict`, `/clear`, `/help`, `/bye`.
 - **Multi-file edits** with a diff preview and **y/n** confirmation, with automatic backups and `/undo`.
 - **Self-editing** – ask Forge to add a feature to itself; it backs up first and auto-restores if the change breaks it.
-- **Typing predictions** – grey ghost text suggests what you're typing from your history; press → to accept.
+- **Typing predictions**: grey ghost text finishes what you're typing; press **→ or Tab** to accept (Tab still opens the `/` command menu when nothing is suggested). Matches from your history come first (instant); with `/predict ai` a small fast model (`qwen3:1.7b` or `qwen3:4b`) suggests the next words after a ~350 ms pause, in the background so typing never lags. `/predict ai|history|off` switches mode (saved in `~/.forge/config.json`); AI mode is on by default only with a GPU of 8 GB+ VRAM.
+- **Hidden reasoning**: thinking models (qwen3, deepseek-r1) never show their raw reasoning in the answer.
 - **Memory** – remembers useful facts about you and your projects in `~/Forge/memory`.
 
 ## 📦 Install
@@ -57,7 +58,7 @@ export FORGE_USER="YourName"
 ```
 or in `~/.forge/config.json`:
 ```json
-{"user_name": "YourName", "models": {"chat": "qwen3:4b", "code": "qwen3:14b", "plan": "qwen3:14b"}}
+{"user_name": "YourName", "models": {"chat": "qwen3:4b", "code": "qwen3:14b", "plan": "qwen3:14b"}, "predict": "ai", "predict_model": "qwen3:1.7b"}
 ```
 Forge uses `ollama` from your PATH (falls back to the standard install locations) and starts it automatically if it isn't running. Memory and backups are stored in `~/Forge/memory` and `~/Forge/backups` (created automatically).
 
